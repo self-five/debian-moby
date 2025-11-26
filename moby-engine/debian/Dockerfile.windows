@@ -1,0 +1,71 @@
+#
+# use Debian packaging to build Windows binaries (so they inherit all our same patches, etc)
+#
+
+FROM debian:trixie-slim
+
+RUN set -eux; \
+	apt-get install --update -y --no-install-recommends \
+# uscan, origtargz
+		devscripts \
+	; \
+	apt-get dist-clean
+
+WORKDIR /tmp/moby-engine
+
+# install Build-Depends (we don't need all of these, but this is the easiest way to make sure we maintain the version data in a DRY way, and I care about that more than not installing too many packages)
+COPY control debian/
+RUN set -eux; \
+	apt-get update; \
+	apt-get build-dep -y --no-install-recommends .; \
+	apt-get dist-clean
+
+# get go-winres for "manifesting" exe files
+# (this is used automatically by the upstream scripts, but not needed for Linux so it isn't in the Build-Depends or even packaged for Debian since it's a Windows-specific need)
+RUN set -eux; \
+# if some non-PATH Go got installed with our build deps, use that explicitly (see debian/control & debian/rules)
+	set -- /usr/lib/go-*/bin/go; \
+	for go; do \
+		if [ -x "$go" ] && "$go" version; then \
+			dir="$(dirname "$go")"; \
+			export PATH="$dir:$PATH"; \
+			break; \
+		fi; \
+	done; \
+	go version; \
+	GOBIN=/usr/local/bin \
+		go install -v \
+# https://github.com/tc-hib/go-winres/releases
+		github.com/tc-hib/go-winres@v0.3.3 \
+	; \
+	go-winres --help
+
+# download and extract upstream source
+COPY source/ debian/source/
+COPY changelog copyright watch debian/
+RUN uscan --download-current-version
+RUN origtargz --unpack
+
+# apply patches
+COPY patches/ debian/patches/
+RUN dpkg-source --before-build .
+
+COPY . debian
+
+# set up GOPATH symlink farm
+RUN debian/rules override_dh_auto_configure
+
+# compile for Windows
+RUN set -eux; \
+	mkdir /build; \
+	for GOARCH in amd64 arm64; do \
+		debian/rules _build-engine GOOS=windows GOARCH="$GOARCH"; \
+		mkdir "/build/$GOARCH"; \
+		cp -alL \
+			bundles/dynbinary-daemon/dockerd.exe \
+			bundles/dynbinary-daemon/docker-proxy.exe \
+			"/build/$GOARCH/" \
+		; \
+	done
+
+WORKDIR /build
